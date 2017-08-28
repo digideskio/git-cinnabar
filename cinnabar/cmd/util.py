@@ -84,7 +84,10 @@ def tree_hash(files, full_base, base=''):
             attr = '40000'
         else:
             sha1 = git_hash('blob', open(path).read())
-            attr = '100644'
+            if os.stat(path).st_mode & 0111:
+                attr = '100755'
+            else:
+                attr = '100644'
             logging.debug('%s %s %s%s', attr, sha1, base, f)
         content += '%s %s\0%s' % (attr, f, unhexlify(sha1))
     sha1 = git_hash('tree', content)
@@ -93,7 +96,7 @@ def tree_hash(files, full_base, base=''):
 
 
 def helper_hash():
-    script_path = os.path.dirname(os.path.abspath(sys.argv[0]))
+    script_path = os.path.join(os.path.dirname(__file__), '..', '..')
     d = os.path.join(script_path, 'helper')
     files = (os.listdir(d) if os.path.exists(d) else ())
 

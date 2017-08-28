@@ -65,7 +65,7 @@ endif
 ifdef PYTHON_CHECKS
 
 before_install::
-	$(call PIP_INSTALL,flake8)
+	$(call PIP_INSTALL,flake8 nose)
 
 before_script::
 
