@@ -1,329 +1,63 @@
 #!/usr/bin/env python2.7
-import base64
-import datetime
 import hashlib
-import json
-import numbers
 import os
-import requests
+import pipes
 import sys
-import uuid
 
-from collections import OrderedDict
 from distutils.version import StrictVersion as Version
 from itertools import chain
-from string import Formatter
 
 BASE_DIR = os.path.dirname(__file__)
+sys.path.append(BASE_DIR)
 sys.path.append(os.path.join(BASE_DIR, '..'))
 
-from cinnabar.cmd.util import (
-    helper_hash,
-    tree_hash,
-)
+from docker import DockerRegistry
+from tasks import Task
+from variables import *
+
+from cinnabar.cmd.util import helper_hash
 from cinnabar.git import Git
 from cinnabar.util import one
 
 
-if 'TASK_ID' in os.environ:
-    PROXY_INDEX_URL = 'http://taskcluster/index/v1/task/{}'
-else:
-    PROXY_INDEX_URL = 'https://index.taskcluster.net/v1/task/{}'
-ARTIFACT_URL = 'https://queue.taskcluster.net/v1/task/{}/artifacts/{}'
-
-GITHUB_HEAD_USER = os.environ.get('GITHUB_HEAD_USER', 'glandium')
-GITHUB_HEAD_USER_EMAIL = os.environ.get('GITHUB_HEAD_USER_EMAIL', 'glandium@')
-GITHUB_HEAD_REPO_NAME = os.environ.get('GITHUB_HEAD_REPO_NAME', 'git-cinnabar')
-GITHUB_HEAD_REPO_URL = os.environ.get(
-    'GITHUB_HEAD_REPO_URL',
-    'https://github.com/{}/{}'.format(GITHUB_HEAD_USER, GITHUB_HEAD_REPO_NAME))
-GITHUB_HEAD_SHA = os.environ.get('GITHUB_HEAD_SHA', 'HEAD')
-GITHUB_HEAD_BRANCH = os.environ.get('GITHUB_HEAD_BRANCH', 'HEAD')
-GITHUB_BASE_USER = os.environ.get('GITHUB_BASE_USER', GITHUB_HEAD_USER)
-GITHUB_BASE_REPO_NAME = os.environ.get('GITHUB_BASE_REPO_NAME',
-                                       GITHUB_HEAD_REPO_NAME)
+MSYS_VERSION = '20161025'
+INFRA_EXPIRY = '2 hours'
 
 
-def slugid():
-    rawBytes = uuid.uuid4().bytes
-    # Ensure base64-encoded bytes start with [A-Za-f]
-    first = ord(rawBytes[0])
-    if first >= 0xd0:
-        rawBytes = chr(first & 0x7f) + rawBytes[1:]
-    return base64.urlsafe_b64encode(rawBytes)[:-2]  # Drop '==' padding
+def run_task(wrapper, command):
+    return [
+        wrapper,
+        '--repo',
+        GITHUB_HEAD_REPO_URL,
+        '--checkout',
+        GITHUB_HEAD_SHA,
+        '--',
+        'sh',
+        '-x',
+        '-c',
+        command
+    ]
 
+def run_task_sh(command):
+    return run_task('run-task.sh', command)
 
-timedelta = datetime.timedelta
-
-
-class datetime(datetime.datetime):
-    def format(self, no_usec=True):
-        if no_usec:
-            return self.replace(microsecond=0).isoformat() + 'Z'
-        if self.microsecond == 0:
-            return self.isoformat() + '.000000Z'
-        return self.isoformat() + 'Z'
-
-    def __add__(self, other):
-        if isinstance(other, numbers.Number):
-            other = timedelta(seconds=other)
-        d = super(datetime, self).__add__(other)
-        return self.combine(d.date(), d.timetz())
-
-
-task_group_id = os.environ.get('TASK_ID') or slugid()
-now = datetime.utcnow()
-
-
-class Index(dict):
-    class Existing(str):
-        pass
-
-    def __init__(self, requests=requests):
-        super(Index, self).__init__()
-        self.requests = requests
-
-    def __missing__(self, key):
-        result = None
-        if (GITHUB_BASE_USER != GITHUB_HEAD_USER or
-                GITHUB_BASE_REPO_NAME != GITHUB_HEAD_REPO_NAME):
-            result = self.try_key('github.{}.{}.{}'.format(
-                GITHUB_HEAD_USER, GITHUB_HEAD_REPO_NAME, key))
-        if not result:
-            result = self.try_key('github.{}.{}.{}'.format(
-                GITHUB_BASE_USER, GITHUB_BASE_REPO_NAME, key), create=True)
-        self[key] = result
-        return result
-
-    def try_key(self, key, create=False):
-        response = self.requests.get(PROXY_INDEX_URL.format(key))
-        result = None
-        if response.status_code >= 400:
-            # Consume content before returning, so that the connection
-            # can be reused.
-            response.content
-        else:
-            data = response.json()
-            try:
-                expires = datetime.strptime(data['expires'].rstrip('Z'),
-                                            '%Y-%m-%dT%H:%M:%S.%f')
-            except (KeyError, ValueError):
-                expires = now
-            # Only consider tasks that aren't expired or won't expire
-            # within the hour.
-            if expires >= now + 3600:
-                result = data.get('taskId')
-        if result:
-            print 'Found task "{}" for "{}"'.format(result, key)
-            return self.Existing(result)
-        elif not create:
-            return None
-        return slugid()
-
-
-class DockerRegistry(object):
-    def __init__(self, base_dir):
-        self.data_hash = {}
-        self.base = {}
-        for f in os.listdir(base_dir or '.'):
-            prefix = 'docker-'
-            if not f.startswith(prefix):
-                continue
-            d = os.path.join(base_dir, f)
-            if not os.path.isdir(d):
-                continue
-            name = f[len(prefix):]
-            docker_file = os.path.join(d, 'Dockerfile')
-            with open(docker_file) as fh:
-                base = one(l for l in fh.readlines() if l.startswith('FROM '))
-            if base:
-                _, base = base.split(None, 1)
-                prefix = '${REPO_NAME}-'
-                if base.startswith(prefix):
-                    base = base[len(prefix):].strip()
-                    self.base[name] = base
-            self.data_hash[name] = tree_hash(os.listdir(d), d)
-
-    def __iter__(self):
-        emitted = set()
-        for i in set(self.data_hash) - set(self.base):
-            yield i
-            emitted.add(i)
-        by_base = {}
-        for k, v in self.base.iteritems():
-            by_base.setdefault(v, []).append(k)
-        while len(emitted) < len(self.data_hash):
-            for i in tuple(emitted):
-                for j in by_base.get(i, []):
-                    if j not in emitted:
-                        yield j
-                        emitted.add(j)
-
-    def __contains__(self, key):
-        return key in self.data_hash
-
-    def hash(self, name):
-        base = self.base.get(name)
-        if base:
-            h = hashlib.sha1(self.hash(base))
-            h.update(self.data_hash[name])
-            return h.hexdigest()
-        else:
-            return self.data_hash[name]
-
-
-session = requests.Session()
-
-
-class Task(object):
-    index = Index(session)
-    by_id = OrderedDict()
-
-    class Resolver(Formatter):
-        def __init__(self):
-            self._used = set()
-
-        def get_value(self, key, args, kwargs):
-            task = Task.by_id.get(key)
-            if task:
-                self._used.add(task)
-                return task
-            raise KeyError()
-
-        def used(self):
-            for u in self._used:
-                yield u
-
-    def __init__(self, **kwargs):
-        index = kwargs.get('index')
-        if index:
-            self.id = Task.index[index]
-        else:
-            self.id = slugid()
-
-        task = {
-            'created': now.format(),
-            'deadline': (now + 3600).format(),
-            'expires': (now + 86400).format(),
-            'retries': 0,
-            'provisionerId': 'aws-provisioner-v1',
-            'workerType': 'github-worker',
-            'schedulerId': 'taskcluster-github',
-            'taskGroupId': task_group_id,
-            'metadata': {
-                'owner': GITHUB_HEAD_USER_EMAIL,
-                'source': GITHUB_HEAD_REPO_URL,
-            },
-            'payload': {
-                'maxRunTime': 1800,
-            },
-        }
-        dependencies = [task_group_id]
-        self.artifacts = []
-
-        for k, v in kwargs.iteritems():
-            if k in ('provisionerId', 'workerType'):
-                task[k] = v
-            elif k == 'description':
-                task['metadata'][k] = task['metadata']['name'] = v
-            elif k == 'index':
-                task['routes'] = ['index.github.{}.{}.{}'.format(
-                    GITHUB_HEAD_USER, GITHUB_HEAD_REPO_NAME, v)]
-            elif k == 'command':
-                resolver = Task.Resolver()
-                task['payload']['command'] = [
-                    resolver.format(a)
-                    for a in v
-                ]
-                for t in resolver.used():
-                    dependencies.append(t.id)
-
-            elif k in ('artifact', 'artifacts'):
-                if k[-1] == 's':
-                    assert 'artifact' not in kwargs
-                else:
-                    assert 'artifacts' not in kwargs
-                    v = [v]
-                artifacts = {
-                    'public/{}'.format(os.path.basename(a)): {
-                        'path': a,
-                        'type': 'file',
-                    }
-                    for a in v
-                }
-                urls = [
-                    ARTIFACT_URL.format(self.id, a)
-                    for a in artifacts
-                ]
-                if kwargs.get('workerType') == 'dummy-worker-packet':
-                    artifacts = [
-                        a.update(name=name) or a
-                        for name, a in artifacts.iteritems()
-                    ]
-                task['payload']['artifacts'] = artifacts
-                if k[-1] == 's':
-                    self.artifacts = urls
-                else:
-                    self.artifact = urls[0]
-                    self.artifacts = [self.artifact]
-            elif k == 'env':
-                task['payload']['env'] = v
-            elif k == 'image':
-                if isinstance(v, Task):
-                    v = {
-                        'path': 'public/{}'.format(
-                            os.path.basename(v.artifact)),
-                        'taskId': v.id,
-                        'type': 'task-image',
-                    }
-                    dependencies.append(v['taskId'])
-                task['payload']['image'] = v
-            elif k == 'scopes':
-                task[k] = v
-                for s in v:
-                    if s.startswith('secrets:'):
-                        features = task['payload'].setdefault('features', {})
-                        features['taskclusterProxy'] = True
-            else:
-                raise Exception("Don't know how to handle {}".format(k))
-        task['dependencies'] = sorted(dependencies)
-        self.task = task
-        Task.by_id[self.id] = self
-
-    def __str__(self):
-        return self.id
-
-    @classmethod
-    def submit(cls):
-        for task in cls.by_id.itervalues():
-            if isinstance(task.id, Index.Existing):
-                continue
-            print('Submitting task "{}":'.format(task.id))
-            print json.dumps(task.task, indent=4, sort_keys=True)
-            if 'TASK_ID' not in os.environ:
-                continue
-            url = 'http://taskcluster/queue/v1/task/{}'.format(task.id)
-            res = session.put(url, data=json.dumps(task.task))
-            try:
-                res.raise_for_status()
-            except Exception:
-                print(res.headers)
-                print(res.content)
-                raise
-            print(res.json())
+def run_task_cmd(command):
+    return [' '.join(pipes.quote(a)
+                     for a in run_task('*\\run-task.cmd', command))]
 
 
 registry = DockerRegistry(BASE_DIR)
-images = {}
 for name in registry:
     base = registry.base.get(name) or []
     if base:
-        base = ['{{{}.artifact}}'.format(images[base])]
-    images[name] = Task(
+        base = ['{{{}.artifact}}'.format(
+            Task.by_index_prefix('docker-image.{}'.format(base)))]
+    Task(
         provisionerId='test-dummy-provisioner',
         workerType='dummy-worker-packet',
         description='docker image: {}'.format(name),
-        index='docker-image.{}'.format(registry.hash(name)),
+        index='docker-image.{}.{}'.format(name, registry.hash(name)),
+        expireIn=INFRA_EXPIRY,
         image='https://s3-us-west-2.amazonaws.com/public-qemu-images'
               '/repository/github.com/taskcluster/taskcluster-worker'
               '/ubuntu-worker.tar.zst',
@@ -338,6 +72,275 @@ for name in registry:
             'REVISION': GITHUB_HEAD_SHA,
             'GITHUB_HEAD_REPO_NAME': GITHUB_HEAD_REPO_NAME,
         }
+    )
+
+for cpu in ('i686', 'x86_64'):
+    command = (
+        'curl -L http://repo.msys2.org/distrib/{cpu}'
+        '/msys2-base-{cpu}-{version}.tar.xz | xz -cd | bzip2 -c'
+        ' > /tmp/msys-base-{cpu}.tar.bz2'.format(cpu=cpu, version=MSYS_VERSION)
+    )
+    msys2_base_hash = hashlib.sha1(command).hexdigest()
+    Task(
+        description='msys2 image: base {}'.format(cpu),
+        index='msys2-image.base.{}.{}'.format(cpu, msys2_base_hash),
+        expireIn=INFRA_EXPIRY,
+        image=Task.by_index_prefix('docker-image.build'),
+        command=run_task_sh(
+            '.taskcluster/msys2-base.sh {} {}'.format(cpu, MSYS_VERSION),
+        ),
+        artifact='/tmp/msys-base-{}.tar.bz2'.format(cpu)
+    )
+
+    packages = [
+        'mingw-w64-{}-{}'.format(cpu, pkg) for pkg in (
+            'curl',
+            'gcc',
+            'make',
+            'pcre',
+            'perl',
+            'python2',
+            'python2-pip',
+        )
+    ] + [
+        'patch',
+    ]
+    Task(
+        description='msys2 image: build {}'.format(cpu),
+        workerType='win2012r2',
+        index='msys2-image.build.{}.{}'.format(
+            cpu, hashlib.sha1(msys2_base_hash + '  ' +
+                              (' '.join(packages))).hexdigest()),
+        command=run_task_cmd(
+            'pacman-key --init && '
+            'pacman-key --populate msys2 && '
+            'pacman --noconfirm -Sy --force --asdeps pacman-mirrors && '
+            'pacman --noconfirm -Sy tar {packages} && '
+            'rm -rf /var/cache/pacman/pkg && '
+            'pip install wheel && '
+            'tar -jcf msys2-{cpu}.tar.bz2 msys*'.format(
+                cpu=cpu,
+                packages=' '.join(packages))),
+        mounts=(Task.by_index_prefix('msys2-image.base.{}'.format(cpu)),),
+        artifact='msys2-{}.tar.bz2'.format(cpu),
+    )
+
+Task.submit()
+sys.exit(0)
+
+for cpu in ('i686', 'x86_64'):
+
+    bits = {
+        'i686': 32,
+        'x86_64': 64,
+    }[cpu]
+    command = (
+        'cd /tmp && '
+        'curl -OL https://github.com/git-for-windows/git/releases/download'
+        '/v2.14.1.windows.1/MinGit-2.14.1-{}-bit.zip && '
+        'mkdir git && '
+        'cd git && '
+        'apt-get install unzip && '
+        'unzip ../MinGit-2.14.1-{}-bit.zip && '
+        'cd .. && '
+        'tar -jcf git-{}.tar.bz2 git/'
+    ).format(bits, bits, cpu)
+
+    git = Task(
+        description='git {}'.format(cpu),
+        provisionerId='test-dummy-provisioner',
+        workerType='dummy-worker-packet',
+        image='https://s3-us-west-2.amazonaws.com/public-qemu-images'
+              '/repository/github.com/taskcluster/taskcluster-worker'
+              '/ubuntu-worker.tar.zst',
+        command=[
+            'sh',
+            '-x',
+            '-c',
+            command,
+        ],
+        artifact='/tmp/git-{}.tar.bz2'.format(cpu)
+    )
+
+
+    mingw = {
+        'i686': 'MINGW32',
+        'x86_64': 'MINGW64',
+    }.get(cpu)
+    msys = {
+        'i686': 'msys32',
+        'x86_64': 'msys64',
+    }.get(cpu)
+    packages = [
+        'mingw-w64-{}-{}'.format(cpu, pkg) for pkg in (
+            'curl',
+            'gcc',
+            'make',
+            'pcre',
+            'perl',
+            'python2',
+            'python2-pip',
+        )
+    ] + [
+        'patch',
+    ]
+    msys2_build = Task(
+        description='msys2 build {}'.format(cpu),
+        workerType='win2012r2',
+        index='msys2.build.{}.{}'.format(
+            cpu, hashlib.sha1(msys2_base_hash + '  ' +
+                              (' '.join(packages))).hexdigest()),
+        command=[
+            'set PATH=%CD%\\{msys}\\{mingw}\\bin;%CD%\\{msys}\\usr\\bin'
+            ';%PATH%'.format(msys=msys, mingw=mingw),
+            'bash /usr/bin/pacman-key --init',
+            'bash /usr/bin/pacman-key --populate msys2',
+            'pacman --noconfirm -Sy --force --asdeps pacman-mirrors',
+            'pacman --noconfirm -Sy tar {}'.format(' '.join(packages)),
+            'rm -rf /var/cache/pacman/pkg',
+            'pip install wheel',
+            'tar -jcf msys2-{}.tar.bz2 {}'.format(cpu, msys),
+        ],
+        env={
+            'MSYSTEM': mingw,
+        },
+        mounts=(msys2_base,),
+        artifact='msys2-{}.tar.bz2'.format(cpu),
+    )
+    packages = [
+        'mingw-w64-{}-{}'.format(cpu, pkg) for pkg in (
+            'curl',
+            'make',
+            'pcre',
+            'python2',
+            'python2-pip',
+        )
+    ] + [
+        'diffutils',
+        'git',
+    ]
+    msys2_test = Task(
+        description='msys2 test {}'.format(cpu),
+        workerType='win2012r2',
+        index='msys2.test.{}.{}'.format(
+            cpu, hashlib.sha1(msys2_base_hash + '  ' +
+                              (' '.join(packages))).hexdigest()),
+        command=[
+            'set PATH=%CD%\\{msys}\\{mingw}\\bin;%CD%\\{msys}\\usr\\bin'
+            ';%PATH%'.format(msys=msys, mingw=mingw),
+            'bash /usr/bin/pacman-key --init',
+            'bash /usr/bin/pacman-key --populate msys2',
+            'pacman --noconfirm -Sy --force --asdeps pacman-mirrors',
+            'pacman --noconfirm -Sy tar {}'.format(' '.join(packages)),
+            'rm -rf /var/cache/pacman/pkg',
+            'tar -jcf msys2-{}.tar.bz2 {}'.format(cpu, msys),
+        ],
+        env={
+            'MSYSTEM': mingw,
+        },
+        mounts=(msys2_base,),
+        artifact='msys2-{}.tar.bz2'.format(cpu),
+    )
+
+    version = '4.3.2'
+    mercurial = Task(
+        description='hg v{} {}'.format(version, cpu),
+        index='{}.hg.v{}'.format(msys2_build, version),
+        workerType='win2012r2',
+        command=[
+            'set PATH=%CD%\\{msys}\\{mingw}\\bin;%CD%\\{msys}\\usr\\bin'
+            ';%PATH%'.format(msys=msys, mingw=mingw),
+            'sed -i "1s,.*,#!python2.exe,"'
+            ' {}/{}/bin/pip-script.py'.format(msys, mingw),
+            'pip wheel -v --build-option -b --build-option %CD%\\wheel'
+            ' mercurial=={}'.format(version),
+        ],
+        mounts=(msys2_build,),
+        env={
+            'MSYSTEM': mingw,
+        },
+        artifact='mercurial-{}-cp27-cp27m-mingw.whl'.format(version),
+    )
+
+    helper_cpu = {
+        'i686': 'x86'
+    }.get(cpu, cpu)
+    helper = Task(
+        description='helper {}'.format(cpu),
+        index='helper.{}.windows.{}'.format(helper_hash(), helper_cpu),
+        workerType='win2012r2',
+        command=[
+            'set PATH=%CD%\\{msys}\\{mingw}\\bin;%CD%\\{msys}\\usr\\bin'
+            ';%PATH%'.format(msys=msys, mingw=mingw),
+            'git clone -n {} {}'.format(GITHUB_HEAD_REPO_URL,
+                                        GITHUB_HEAD_REPO_NAME),
+            'cd {}'.format(GITHUB_HEAD_REPO_NAME),
+            'git checkout {}'.format(GITHUB_HEAD_SHA),
+            'bash -c "mingw32-make -j$(nproc) helper"',
+        ],
+        mounts=(msys2_build,),
+        env={
+            'MSYSTEM': mingw,
+        },
+        artifact='git-cinnabar/git-cinnabar-helper.exe',
+    )
+
+    Task(
+        description='test {}'.format(cpu),
+        workerType='win2012r2',
+        command=[
+            'set PATH=%CD%\\{msys}\\{mingw}\\bin;%CD%\\{msys}\\usr\\bin'
+            ';%PATH%'.format(msys=msys, mingw=mingw),
+            'sed -i "1s,.*,#!python2.exe,"'
+            ' {}/{}/bin/pip-script.py'.format(msys, mingw),
+            'pip install {{{}.artifact}}'.format(mercurial),
+            'git clone -n {} {}'.format(GITHUB_HEAD_REPO_URL,
+                                        GITHUB_HEAD_REPO_NAME),
+            'cd {}'.format(GITHUB_HEAD_REPO_NAME),
+            'git checkout {}'.format(GITHUB_HEAD_SHA),
+            'curl --compressed -OL {{{}.artifact}}'.format(helper),
+            'bash -c "for postinst in /etc/post-install/*.post; do'
+            ' test -e $postinst && . $postinst;'
+            ' done"',
+            'set PATH=%CD%;%PATH%',
+            'git --version',
+            'git -c fetch.prune=true clone -n hg::%REPO% hg.old.git',
+            'mingw32-make -f CI.mk script',
+        ],
+        mounts=(msys2_test,),
+        env={
+            'REPO': 'https://hg.mozilla.org/users/mh_glandium.org/jqplot',
+            'MSYSTEM': mingw,
+        },
+    )
+
+    Task(
+        description='test 2 {}'.format(cpu),
+        workerType='win2012r2',
+        command=[
+            'set PATH=%CD%\\git\\cmd;%CD%\\{msys}\\{mingw}\\bin;%CD%\\{msys}\\usr\\bin'
+            ';%PATH%'.format(msys=msys, mingw=mingw),
+            'sed -i "1s,.*,#!python2.exe,"'
+            ' {}/{}/bin/pip-script.py'.format(msys, mingw),
+            'pip install {{{}.artifact}}'.format(mercurial),
+            'git clone -n {} {}'.format(GITHUB_HEAD_REPO_URL,
+                                        GITHUB_HEAD_REPO_NAME),
+            'cd {}'.format(GITHUB_HEAD_REPO_NAME),
+            'git checkout {}'.format(GITHUB_HEAD_SHA),
+            'curl --compressed -OL {{{}.artifact}}'.format(helper),
+            'bash -c "for postinst in /etc/post-install/*.post; do'
+            ' test -e $postinst && . $postinst;'
+            ' done"',
+            'set PATH=%CD%;%PATH%',
+            'git --version',
+            'git -c fetch.prune=true clone -n hg::%REPO% hg.old.git',
+            'mingw32-make -f CI.mk script',
+        ],
+        mounts=(msys2_test, git),
+        env={
+            'REPO': 'https://hg.mozilla.org/users/mh_glandium.org/jqplot',
+            'MSYSTEM': mingw,
+        },
     )
 
 GIT_VERSIONS = ('1.8.5', '2.7.4', '2.14.1')
@@ -365,7 +368,8 @@ for version in GIT_VERSIONS:
         artifact='/tmp/git-{}.tar.xz'.format(version),
     )
 
-MERCURIAL_VERSIONS = ('1.9', '2.5', '2.6.2', '2.7.2', '3.0', '3.6', '4.3.1')
+MERCURIAL_VERSIONS = ('1.9', '2.5', '2.6.2', '2.7.2', '3.0', '3.6', '4.3.1',
+                      '4.4')
 mercurial = {}
 for version in MERCURIAL_VERSIONS:
     # 2.6.2 is the first version available on pypi
@@ -484,7 +488,7 @@ clones = {}
 for version in (GITHUB_HEAD_SHA,) + UPGRADE_FROM:
     sha1 = one(Git.iter('rev-parse', version))
     if version == GITHUB_HEAD_SHA:
-        download = 'curl -sOL {{{}.artifact}} && ' \
+        download = 'curl --compressed -OL {{{}.artifact}} && ' \
                    'chmod +x git-cinnabar-helper && '.format(helpers[''])
     elif Version('0.4.0') <= version:
         download = './git-cinnabar download && '
@@ -588,16 +592,16 @@ for git_ver, hg_ver, variants in chain(
             'sh',
             '-x',
             '-c',
-            'curl -sOL {{{}.artifacts[0]}} && '
+            'curl --compressed -OL {{{}.artifacts[0]}} && '
             'chmod +x git-cinnabar-helper && '
-            'curl -sL {{{}.artifact}} | tar -Jxf - && '
+            'curl -L {{{}.artifact}} | tar -Jxf - && '
             'make -f CI.mk script{}'.format(helpers[helper], clone, postcmd)
         ],
         **kwargs
     )
 
 upload_coverage = ' && '.join(
-    'curl -sL {{{}.artifacts[0]}} | tar -Jxf - && codecov --name "{}"'
+    'curl -L {{{}.artifacts[0]}} | tar -Jxf - && codecov --name "{}"'
     ' --commit {} --branch {} && '
     'find . \( -name .coverage -o -name coverage.xml -o -name \*.gcda'
     ' -o -name \*.gcov \) -delete'.format(
@@ -624,8 +628,16 @@ Task(
         'python -c "import json, sys; print(json.load(sys.stdin)'
         '[\\"secret\\"][\\"token\\"])") && '
         'set -x && '
-        'curl -sL {{{}.artifacts[1]}} | tar -Jxf - && '
+        'curl -L {{{}.artifacts[1]}} | tar -Jxf - && '
         '{}'.format(helpers['coverage'], upload_coverage)
+    ]
+)
+
+Task(
+    description='windows test',
+    workerType='win2012r2',
+    command=[
+        'env',
     ]
 )
 
